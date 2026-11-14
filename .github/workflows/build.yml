@@ -1,0 +1,111 @@
+# Rebuild only when Caddy or one of the two plugins has a new release.
+# A daily check compares the latest upstream versions with versions.json; on a change it builds,
+# pushes ghcr.io/qlandman/caddy-cloudflare-proxy and commits the new versions.json.
+name: build
+
+on:
+  schedule:
+    - cron: "17 5 * * *"        # daily check, ~06:17 CET
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Build even if nothing changed"
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths: [Dockerfile, .github/workflows/build.yml]
+
+permissions:
+  contents: write     # commit versions.json
+  packages: write     # push to GHCR
+
+env:
+  IMAGE: ghcr.io/qlandman/caddy-cloudflare-proxy
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve latest upstream versions
+        id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          caddy=$(gh api repos/caddyserver/caddy/releases/latest --jq .tag_name | sed 's/^v//')
+          # caddy-dns/cloudflare publishes tags, not releases
+          cloudflare=$(gh api repos/caddy-dns/cloudflare/tags --paginate --jq '.[].name' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          docker_proxy=$(gh api repos/lucaslorentz/caddy-docker-proxy/releases/latest --jq .tag_name)
+          for x in "$caddy" "$cloudflare" "$docker_proxy"; do [ -n "$x" ] || { echo "empty version"; exit 1; }; done
+          echo "caddy=$caddy" >> "$GITHUB_OUTPUT"
+          echo "cloudflare=$cloudflare" >> "$GITHUB_OUTPUT"
+          echo "docker_proxy=$docker_proxy" >> "$GITHUB_OUTPUT"
+          new=$(jq -n --arg a "$caddy" --arg b "$cloudflare" --arg c "$docker_proxy" '{caddy:$a,cloudflare:$b,docker_proxy:$c}')
+          if [ "$(jq -cS . <<<"$new")" = "$(jq -cS . versions.json)" ]; then changed=false; else changed=true; fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          echo "Upstream: caddy $caddy, cloudflare $cloudflare, docker-proxy $docker_proxy (changed=$changed)"
+
+      - name: Decide
+        id: go
+        run: |
+          if [ "${{ steps.v.outputs.changed }}" = "true" ] || [ "${{ github.event_name }}" = "push" ] || [ "${{ inputs.force }}" = "true" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"; echo "Nothing new, skipping build."
+          fi
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        if: steps.go.outputs.build == 'true'
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        if: steps.go.outputs.build == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        if: steps.go.outputs.build == 'true'
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          build-args: |
+            CADDY_VERSION=${{ steps.v.outputs.caddy }}
+            CLOUDFLARE_VERSION=${{ steps.v.outputs.cloudflare }}
+            DOCKER_PROXY_VERSION=${{ steps.v.outputs.docker_proxy }}
+          # <caddy>-<date> is the immutable tag to pin in compose (WUD watches it);
+          # <caddy> and latest move along.
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.v.outputs.caddy }}-${{ steps.v.outputs.date }}
+            ${{ env.IMAGE }}:${{ steps.v.outputs.caddy }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test
+        if: steps.go.outputs.build == 'true'
+        run: |
+          img=${{ env.IMAGE }}:${{ steps.v.outputs.caddy }}-${{ steps.v.outputs.date }}
+          docker pull "$img"
+          docker run --rm "$img" caddy version
+          mods=$(docker run --rm "$img" caddy list-modules)
+          echo "$mods" | grep -qx 'dns.providers.cloudflare' || { echo "cloudflare module missing"; exit 1; }
+          echo "$mods" | grep -qx 'docker_proxy' || { echo "docker_proxy module missing"; exit 1; }
+
+      - name: Record built versions
+        if: steps.go.outputs.build == 'true'
+        run: |
+          jq -n --arg a "${{ steps.v.outputs.caddy }}" --arg b "${{ steps.v.outputs.cloudflare }}" --arg c "${{ steps.v.outputs.docker_proxy }}" \
+            '{caddy:$a,cloudflare:$b,docker_proxy:$c}' > versions.json
+          if ! git diff --quiet versions.json; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "Built caddy ${{ steps.v.outputs.caddy }} (cloudflare ${{ steps.v.outputs.cloudflare }}, docker-proxy ${{ steps.v.outputs.docker_proxy }})" versions.json
+            git push
+          fi
