@@ -1,13 +1,18 @@
-# Daily: rebuild only when Caddy or one of the two plugins has a new release (compared with versions.json).
-# Weekly (Monday): always rebuild, so security fixes in the caddy:<version>-alpine base image are picked up.
-# Every build commits last-build.json: that is also the repo activity that keeps GitHub from disabling
-# scheduled workflows in a public repo after 60 days without commits.
+# Build only when something actually changed. A daily check compares, against versions.json:
+#   - the latest Caddy release and the latest tags of both plugins
+#   - the digests of the official base images caddy:<version>-builder and caddy:<version>-alpine
+#     (Docker Hub republishes those for Alpine/Go security fixes between Caddy releases)
+# No change: nothing is built, no new image, no restart on the Docker host.
+# Change: build, smoke-test, push ghcr.io/qlandman/caddy-cloudflare-proxy, commit versions.json and
+# last-build.json, and prune old image versions (keep 10).
+# A monthly keepalive commit (last-check.json) stops GitHub from disabling the schedule in this
+# public repo after 60 days without commits.
 name: build
 
 on:
   schedule:
-    - cron: "17 5 * * *"        # daily check for new releases, ~06:17 CET
-    - cron: "43 4 * * 1"        # weekly forced rebuild (base image fixes), Monday ~05:43 CET
+    - cron: "17 5 * * *"        # daily check, ~06:17 CET
+    - cron: "29 5 1 * *"        # monthly keepalive (1st of the month)
   workflow_dispatch:
     inputs:
       force:
@@ -19,8 +24,8 @@ on:
     paths: [Dockerfile, .github/workflows/build.yml]
 
 permissions:
-  contents: write     # commit versions.json
-  packages: write     # push to GHCR
+  contents: write     # commit versions.json / last-build.json / last-check.json
+  packages: write     # push to and prune GHCR
 
 env:
   IMAGE: ghcr.io/qlandman/caddy-cloudflare-proxy
@@ -31,7 +36,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Resolve latest upstream versions
+      - name: Resolve latest upstream versions and base image digests
         id: v
         env:
           GH_TOKEN: ${{ github.token }}
@@ -41,20 +46,24 @@ jobs:
           # caddy-dns/cloudflare publishes tags, not releases
           cloudflare=$(gh api repos/caddy-dns/cloudflare/tags --paginate --jq '.[].name' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
           docker_proxy=$(gh api repos/lucaslorentz/caddy-docker-proxy/releases/latest --jq .tag_name)
-          for x in "$caddy" "$cloudflare" "$docker_proxy"; do [ -n "$x" ] || { echo "empty version"; exit 1; }; done
-          echo "caddy=$caddy" >> "$GITHUB_OUTPUT"
-          echo "cloudflare=$cloudflare" >> "$GITHUB_OUTPUT"
-          echo "docker_proxy=$docker_proxy" >> "$GITHUB_OUTPUT"
-          new=$(jq -n --arg a "$caddy" --arg b "$cloudflare" --arg c "$docker_proxy" '{caddy:$a,cloudflare:$b,docker_proxy:$c}')
+          builder=$(docker buildx imagetools inspect "caddy:${caddy}-builder" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          base=$(docker buildx imagetools inspect "caddy:${caddy}-alpine" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          for x in "$caddy" "$cloudflare" "$docker_proxy" "$builder" "$base"; do [ -n "$x" ] || { echo "empty value"; exit 1; }; done
+          new=$(jq -n --arg a "$caddy" --arg b "$cloudflare" --arg c "$docker_proxy" --arg d "$builder" --arg e "$base" \
+            '{caddy:$a,cloudflare:$b,docker_proxy:$c,builder_digest:$d,base_digest:$e}')
+          echo "$new" > /tmp/versions.new.json
           if [ "$(jq -cS . <<<"$new")" = "$(jq -cS . versions.json)" ]; then changed=false; else changed=true; fi
-          echo "changed=$changed" >> "$GITHUB_OUTPUT"
-          echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
-          echo "Upstream: caddy $caddy, cloudflare $cloudflare, docker-proxy $docker_proxy (changed=$changed)"
+          { echo "caddy=$caddy"; echo "cloudflare=$cloudflare"; echo "docker_proxy=$docker_proxy"
+            echo "changed=$changed"; echo "date=$(date -u +%Y%m%d)"; } >> "$GITHUB_OUTPUT"
+          echo "Upstream: caddy $caddy, cloudflare $cloudflare, docker-proxy $docker_proxy"
+          echo "Base: builder $builder, alpine $base"
+          echo "Changed vs versions.json: $changed"
+          [ "$changed" = true ] && diff <(jq -S . versions.json) <(jq -S . <<<"$new") || true
 
       - name: Decide
         id: go
         run: |
-          if [ "${{ steps.v.outputs.changed }}" = "true" ] || [ "${{ github.event_name }}" = "push" ] || [ "${{ inputs.force }}" = "true" ] || [ "${{ github.event.schedule }}" = "43 4 * * 1" ]; then
+          if [ "${{ steps.v.outputs.changed }}" = "true" ] || [ "${{ github.event_name }}" = "push" ] || [ "${{ inputs.force }}" = "true" ]; then
             echo "build=true" >> "$GITHUB_OUTPUT"
           else
             echo "build=false" >> "$GITHUB_OUTPUT"; echo "Nothing new, skipping build."
@@ -77,12 +86,12 @@ jobs:
           platforms: linux/amd64
           push: true
           provenance: false
+          pull: true
           build-args: |
             CADDY_VERSION=${{ steps.v.outputs.caddy }}
             CLOUDFLARE_VERSION=${{ steps.v.outputs.cloudflare }}
             DOCKER_PROXY_VERSION=${{ steps.v.outputs.docker_proxy }}
-          # <caddy>-<date> is the immutable tag to pin in compose (WUD watches it);
-          # <caddy> and latest move along.
+          # <caddy>-<date> is immutable (rollback); <caddy> and latest move along.
           tags: |
             ${{ env.IMAGE }}:${{ steps.v.outputs.caddy }}-${{ steps.v.outputs.date }}
             ${{ env.IMAGE }}:${{ steps.v.outputs.caddy }}
@@ -103,13 +112,30 @@ jobs:
       - name: Record build
         if: steps.go.outputs.build == 'true'
         run: |
-          jq -n --arg a "${{ steps.v.outputs.caddy }}" --arg b "${{ steps.v.outputs.cloudflare }}" --arg c "${{ steps.v.outputs.docker_proxy }}" \
-            '{caddy:$a,cloudflare:$b,docker_proxy:$c}' > versions.json
+          cp /tmp/versions.new.json versions.json
           jq -n --arg tag "${{ steps.v.outputs.caddy }}-${{ steps.v.outputs.date }}" --arg at "$(date -u +%FT%TZ)" \
-            --arg reason "${{ github.event_name }}${{ github.event.schedule && format(' {0}', github.event.schedule) || '' }}" \
-            --arg run "${{ github.run_id }}" '{tag:$tag,built_at:$at,reason:$reason,run:$run}' > last-build.json
+            --arg reason "${{ github.event_name }}" --arg run "${{ github.run_id }}" \
+            '{tag:$tag,built_at:$at,reason:$reason,run:$run}' > last-build.json
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add versions.json last-build.json
           git commit -m "Built ${{ steps.v.outputs.caddy }}-${{ steps.v.outputs.date }} (cloudflare ${{ steps.v.outputs.cloudflare }}, docker-proxy ${{ steps.v.outputs.docker_proxy }})"
+          git push
+
+      - name: Prune old image versions (keep 10)
+        if: steps.go.outputs.build == 'true'
+        uses: actions/delete-package-versions@e5bc658cc4c965c472efe991f8beea3981499c55 # v5.0.0
+        with:
+          package-name: caddy-cloudflare-proxy
+          package-type: container
+          min-versions-to-keep: 10
+
+      - name: Monthly keepalive
+        if: github.event.schedule == '29 5 1 * *' && steps.go.outputs.build != 'true'
+        run: |
+          jq -n --arg at "$(date -u +%FT%TZ)" '{checked_at:$at,note:"keeps the scheduled workflow enabled (public repo, 60-day inactivity rule)"}' > last-check.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add last-check.json
+          git commit -m "Keepalive $(date -u +%Y-%m)"
           git push
