@@ -1,5 +1,5 @@
 {
-  "caddy": "",
-  "cloudflare": "",
-  "docker_proxy": ""
+  "caddy": "2.11.9",
+  "cloudflare": "v0.2.4",
+  "docker_proxy": "v2.13.1"
 }
