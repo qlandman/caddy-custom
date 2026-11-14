@@ -1,11 +1,13 @@
-# Rebuild only when Caddy or one of the two plugins has a new release.
-# A daily check compares the latest upstream versions with versions.json; on a change it builds,
-# pushes ghcr.io/qlandman/caddy-cloudflare-proxy and commits the new versions.json.
+# Daily: rebuild only when Caddy or one of the two plugins has a new release (compared with versions.json).
+# Weekly (Monday): always rebuild, so security fixes in the caddy:<version>-alpine base image are picked up.
+# Every build commits last-build.json: that is also the repo activity that keeps GitHub from disabling
+# scheduled workflows in a public repo after 60 days without commits.
 name: build
 
 on:
   schedule:
-    - cron: "17 5 * * *"        # daily check, ~06:17 CET
+    - cron: "17 5 * * *"        # daily check for new releases, ~06:17 CET
+    - cron: "43 4 * * 1"        # weekly forced rebuild (base image fixes), Monday ~05:43 CET
   workflow_dispatch:
     inputs:
       force:
@@ -52,7 +54,7 @@ jobs:
       - name: Decide
         id: go
         run: |
-          if [ "${{ steps.v.outputs.changed }}" = "true" ] || [ "${{ github.event_name }}" = "push" ] || [ "${{ inputs.force }}" = "true" ]; then
+          if [ "${{ steps.v.outputs.changed }}" = "true" ] || [ "${{ github.event_name }}" = "push" ] || [ "${{ inputs.force }}" = "true" ] || [ "${{ github.event.schedule }}" = "43 4 * * 1" ]; then
             echo "build=true" >> "$GITHUB_OUTPUT"
           else
             echo "build=false" >> "$GITHUB_OUTPUT"; echo "Nothing new, skipping build."
@@ -98,14 +100,16 @@ jobs:
           echo "$mods" | grep -qx 'dns.providers.cloudflare' || { echo "cloudflare module missing"; exit 1; }
           echo "$mods" | grep -qx 'docker_proxy' || { echo "docker_proxy module missing"; exit 1; }
 
-      - name: Record built versions
+      - name: Record build
         if: steps.go.outputs.build == 'true'
         run: |
           jq -n --arg a "${{ steps.v.outputs.caddy }}" --arg b "${{ steps.v.outputs.cloudflare }}" --arg c "${{ steps.v.outputs.docker_proxy }}" \
             '{caddy:$a,cloudflare:$b,docker_proxy:$c}' > versions.json
-          if ! git diff --quiet versions.json; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git commit -m "Built caddy ${{ steps.v.outputs.caddy }} (cloudflare ${{ steps.v.outputs.cloudflare }}, docker-proxy ${{ steps.v.outputs.docker_proxy }})" versions.json
-            git push
-          fi
+          jq -n --arg tag "${{ steps.v.outputs.caddy }}-${{ steps.v.outputs.date }}" --arg at "$(date -u +%FT%TZ)" \
+            --arg reason "${{ github.event_name }}${{ github.event.schedule && format(' {0}', github.event.schedule) || '' }}" \
+            --arg run "${{ github.run_id }}" '{tag:$tag,built_at:$at,reason:$reason,run:$run}' > last-build.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add versions.json last-build.json
+          git commit -m "Built ${{ steps.v.outputs.caddy }}-${{ steps.v.outputs.date }} (cloudflare ${{ steps.v.outputs.cloudflare }}, docker-proxy ${{ steps.v.outputs.docker_proxy }})"
+          git push

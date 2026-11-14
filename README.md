@@ -17,7 +17,10 @@ Image: `ghcr.io/qlandman/caddy-cloudflare-proxy`
 
 `.github/workflows/build.yml` runs daily. It looks up the newest Caddy release and the newest
 tags of both plugins, compares them with `versions.json`, and only builds when something changed
-(or on a push to the Dockerfile/workflow, or a manual run with *force*). After a successful build
+(or on a push to the Dockerfile/workflow, or a manual run with *force*). Every Monday it rebuilds
+regardless, to pick up security fixes in the `caddy:<version>-alpine` base image; each build commits
+`last-build.json`, which also keeps the scheduled workflow from being disabled after 60 days of
+repository inactivity. After a successful build
 and a smoke test (`caddy list-modules` must contain both modules) it commits the new
 `versions.json`. On the Docker host, WUD picks up the new `<caddy>-<date>` tag.
 
